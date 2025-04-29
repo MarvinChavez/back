@@ -13,6 +13,10 @@ from schemas import RutaResponse,AutoResponse
 from sqlalchemy import func
 from collections import OrderedDict
 from sqlalchemy import func
+import os
+from fastapi import Form
+from sqlalchemy import tuple_
+
 router = APIRouter()
 def get_db():
     db = SessionLocal()
@@ -43,6 +47,7 @@ def case_ciudad(campo: str) -> str:
 def ingresos_por_ruta_hoy(
     fecha_inicio: Optional[date] = Query(None),
     servicio: Optional[str] = Query(None),
+    empresa_id: Optional[int] = Query(None),  # Agregar empresa_id como parámetro
     db: Session = Depends(get_db)
 ):
     fecha = fecha_inicio if fecha_inicio else date.today()
@@ -62,6 +67,12 @@ def ingresos_por_ruta_hoy(
 
     params = {"fecha": fecha}
 
+    # Si se recibe empresa_id, agregarlo a la consulta
+    if empresa_id:
+        query_str += " AND ingreso.empresa_id = :empresa_id"
+        params["empresa_id"] = empresa_id
+
+    # Si se especifica un servicio, agregarlo a la consulta
     if servicio:
         query_str += " AND ingreso.servicio = :servicio"
         params["servicio"] = servicio.strip().replace("'", "") 
@@ -70,12 +81,10 @@ def ingresos_por_ruta_hoy(
         GROUP BY ruta.id, ruta.ciudad_inicial, ruta.ciudad_final
         ORDER BY total DESC
     """
-
-    # Corrección: Envolver la consulta en `text()`
     query = db.execute(text(query_str), params)
     ingresos = query.fetchall()
 
-    print(f"Fecha inicio: {fecha_inicio}, Servicio: {servicio}")
+    print(f"Fecha inicio: {fecha_inicio}, Servicio: {servicio}, Empresa ID: {empresa_id}")
 
     # Calcular totales
     total_monto = sum(ingreso.total for ingreso in ingresos)
@@ -88,10 +97,12 @@ def ingresos_por_ruta_hoy(
         "montoTotal": "{:,.0f}".format(math.ceil(total_monto)),  # Separador de miles
         "totalPasajeros": total_pasajeros
     }
+
 @router.get("/bingresosoficina")
 def ingresos_por_oficina_hoy(
     fecha_inicio: Optional[date] = Query(None),
     servicio: Optional[str] = Query(None),
+    empresa_id: Optional[int] = Query(None),  # Agregado el parámetro empresa_id
     db: Session = Depends(get_db)
 ):
     fecha = fecha_inicio if fecha_inicio else date.today()
@@ -109,9 +120,15 @@ def ingresos_por_oficina_hoy(
     
     params = {"fecha": fecha}
 
+    # Filtrar por servicio si es proporcionado
     if servicio:
         query_str += " AND ingreso.servicio = :servicio"
         params["servicio"] = servicio.strip().replace("'", "") 
+    
+    # Filtrar por empresa_id si es proporcionado
+    if empresa_id:
+        query_str += " AND ingreso.empresa_id = :empresa_id"
+        params["empresa_id"] = empresa_id
 
     query_str += """
         GROUP BY ruta.ciudad_inicial
@@ -137,6 +154,7 @@ def ingresos_por_oficina_hoy(
 def ingresos_por_turno_hoy(
     fecha_inicio: Optional[date] = Query(None),
     servicio: Optional[str] = Query(None),
+    empresa_id: Optional[int] = Query(None),  # Agregado el parámetro empresa_id
     db: Session = Depends(get_db)
 ):
     fecha = fecha_inicio if fecha_inicio else date.today()
@@ -157,9 +175,15 @@ def ingresos_por_turno_hoy(
 
     params = {"fecha": fecha}
 
+    # Filtrar por servicio si es proporcionado
     if servicio:
         query_str += " AND ingreso.servicio = :servicio"
-        params["servicio"] = servicio.strip().replace("'", "") 
+        params["servicio"] = servicio.strip().replace("'", "")
+    
+    # Filtrar por empresa_id si es proporcionado
+    if empresa_id:
+        query_str += " AND ingreso.empresa_id = :empresa_id"
+        params["empresa_id"] = empresa_id
 
     query_str += """
         GROUP BY ruta.ciudad_inicial, ruta.ciudad_final, turno.hora
@@ -182,35 +206,30 @@ def ingresos_por_turno_hoy(
         "totalPasajeros": total_pasajeros
     }
 @router.post("/upload-excel")
-async def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_excel(
+    file: UploadFile = File(...),
+    empresa_id: int = Form(...),
+    db: Session = Depends(get_db)
+):
     try:
-        # Guardar temporalmente el archivo
         temp_file_path = f"temp_{file.filename}"
         async with aiofiles.open(temp_file_path, "wb") as temp_file:
             content = await file.read()
             await temp_file.write(content)
 
-        # Leer el archivo con pandas
         df = pd.read_excel(temp_file_path, engine="openpyxl", header=None)
-
-        # Seleccionar columnas desde la 6 hasta la 16 (índices en Pandas van desde 0)
         df = df.iloc[:, 5:16]
 
-        # Definir nombres de columnas en el orden correcto
         expected_columns = [
             "serial1", "serial2", "proveedor", "placa", "pasajero",
             "fecha", "servicio", "hora_turno", "ciudad_inicial", "ciudad_final", "monto"
         ]
-
-        # Asignar nombres de columnas al DataFrame
         df.columns = expected_columns
 
         for _, row in df.iterrows():
-            # Validar datos nulos
             if row.isnull().any():
-                raise HTTPException(status_code=400, detail=f"Fila incompleta: {row.to_dict()}")
+                continue  # O puedes registrar el error y continuar
 
-            # Extraer los valores respetando el orden
             serial = str(row["serial1"]).strip() + str(row["serial2"]).strip()
             proveedor = str(row["proveedor"]).strip()
             placa = str(row["placa"]).strip()
@@ -222,57 +241,63 @@ async def upload_excel(file: UploadFile = File(...), db: Session = Depends(get_d
             ciudad_final = str(row["ciudad_final"]).strip()
             monto = float(row["monto"])
 
-            # Buscar o crear Auto
-            auto = db.query(Auto).filter(Auto.placa == placa).first()
+            # AUTO
+            auto = db.query(Auto).filter_by(placa=placa, empresa_id=empresa_id).first()
             if not auto:
-                auto = Auto(placa=placa, proveedor=proveedor)
+                auto = Auto(placa=placa, proveedor=proveedor, empresa_id=empresa_id)
                 db.add(auto)
-                db.commit()
-                db.refresh(auto)
+                db.flush()
 
-            # Buscar o crear Ruta
-            ruta = db.query(Ruta).filter(Ruta.ciudad_inicial == ciudad_inicial, Ruta.ciudad_final == ciudad_final).first()
+            # RUTA
+            ruta = db.query(Ruta).filter_by(
+                ciudad_inicial=ciudad_inicial,
+                ciudad_final=ciudad_final,
+                empresa_id=empresa_id
+            ).first()
             if not ruta:
-                ruta = Ruta(ciudad_inicial=ciudad_inicial, ciudad_final=ciudad_final)
+                ruta = Ruta(ciudad_inicial=ciudad_inicial, ciudad_final=ciudad_final, empresa_id=empresa_id)
                 db.add(ruta)
-                db.commit()
-                db.refresh(ruta)
+                db.flush()
 
-            # Buscar o crear Turno
-            turno = db.query(Turno).filter(Turno.hora == hora_turno).first()
+            # TURNO
+            turno = db.query(Turno).filter_by(hora=hora_turno, empresa_id=empresa_id).first()
             if not turno:
-                turno = Turno(hora=hora_turno)
+                turno = Turno(hora=hora_turno, empresa_id=empresa_id)
                 db.add(turno)
-                db.commit()
-                db.refresh(turno)
+                db.flush()
 
-            # Insertar en la tabla Ingreso
+            # INGRESO
             ingreso = Ingreso(
-                auto_id=auto.id,
-                ruta_id=ruta.id,
-                turno_id=turno.id,
+                auto=auto,
+                ruta=ruta,
+                turno=turno,
                 fecha=fecha,
                 monto=monto,
                 servicio=servicio,
                 serial=serial,
-                pasajero=pasajero
+                pasajero=pasajero,
+                empresa_id=empresa_id
             )
             db.add(ingreso)
 
-        # Confirmar cambios en la base de datos
         db.commit()
-        return {"message": "Archivo procesado y datos guardados exitosamente"}
+        return {"message": "Archivo procesado y datos guardados exitosamente (duplicados ignorados)"}
 
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error al procesar el archivo: {str(e)}")
-    
+
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
 
 @router.get("/filtrar_ingresos")
 def filtrar_ingresos(
     fecha_inicio: Optional[date] = Query(None), 
     fecha_fin: Optional[date] = Query(default=date.today()),  # 🔹 Corregido
     servicio: Optional[str] = Query(None),
+    empresa_id: Optional[int] = Query(None),  # Agregado el parámetro empresa_id
     db: Session = Depends(get_db)
 ):
     query = db.query(
@@ -289,7 +314,12 @@ def filtrar_ingresos(
     if servicio:
         servicio = servicio.strip().replace("'", "")  # 🔹 Elimina espacios, saltos de línea y comillas
         query = query.filter(Ingreso.servicio == servicio)
-    print(f"Fecha inicio: {fecha_inicio}, Fecha fin: {fecha_fin}, Servicio: '{servicio}'")
+
+    # Filtrar por empresa_id si es proporcionado
+    if empresa_id:
+        query = query.filter(Ingreso.empresa_id == empresa_id)
+
+    print(f"Fecha inicio: {fecha_inicio}, Fecha fin: {fecha_fin}, Servicio: '{servicio}', Empresa ID: {empresa_id}")
 
     ingresos = query.all()
 
@@ -303,12 +333,14 @@ def filtrar_ingresos(
         "montoTotal": f"{sum(i.total for i in ingresos):,.0f}",
         "totalPasajeros": sum(i.total_pasajeros for i in ingresos),
     }
+
 @router.get("/filtrar-oficina")
 def filtrar_oficina(
     ciudades: List[str] = Query(..., description="Lista de ciudades a filtrar"),
     servicio: Optional[str] = None,
     fecha_inicio: Optional[str] = None,
     fecha_fin: Optional[str] = None,
+    empresa_id: Optional[int] = Query(None),  # Agregado el parámetro empresa_id
     db: Session = Depends(get_db)
 ):
     # Construcción de la consulta
@@ -332,6 +364,10 @@ def filtrar_oficina(
         query = query.filter(Ingreso.fecha >= fecha_inicio)
     elif fecha_fin:
         query = query.filter(Ingreso.fecha <= fecha_fin)
+
+    # Agregar filtro por empresa_id si es proporcionado
+    if empresa_id:
+        query = query.filter(Ingreso.empresa_id == empresa_id)
 
     resultados = query.group_by(Ruta.ciudad_inicial, Ingreso.fecha).order_by(Ruta.ciudad_inicial, Ingreso.fecha).all()
 
@@ -377,13 +413,13 @@ def filtrar_oficina(
         "total_general": f"{total_general:,}",
         "total_pasajeros": total_pasajeros
     }
-
 @router.get("/filtrar-ruta")
 def filtrar_ruta(
     rutas: List[int] = Query(..., title="Lista de IDs de rutas"),
     servicio: Optional[str] = Query(None, title="Servicio opcional"),
     fecha_inicio: Optional[str] = Query(None, title="Fecha de inicio"),
     fecha_fin: Optional[str] = Query(None, title="Fecha de fin"),
+    empresa_id: Optional[int] = Query(None, title="ID de la empresa"),
     db: Session = Depends(get_db)
 ):
     query = (
@@ -399,6 +435,7 @@ def filtrar_ruta(
         .filter(Ingreso.ruta_id.in_(rutas))
     )
 
+    # Filtros opcionales
     if servicio:
         query = query.filter(Ingreso.servicio == servicio)
     if fecha_inicio and fecha_fin:
@@ -408,7 +445,15 @@ def filtrar_ruta(
     elif fecha_fin:
         query = query.filter(Ingreso.fecha <= fecha_fin)
 
-    resultados = query.group_by(Ingreso.ruta_id, Ingreso.fecha, Ruta.ciudad_inicial, Ruta.ciudad_final).order_by(Ingreso.fecha).all()
+    if empresa_id:
+        query = query.filter(Ingreso.empresa_id == empresa_id)
+
+    resultados = query.group_by(
+        Ingreso.ruta_id,
+        Ingreso.fecha,
+        Ruta.ciudad_inicial,
+        Ruta.ciudad_final
+    ).order_by(Ingreso.fecha).all()
 
     if not resultados:
         return {"rutas": []}
@@ -424,25 +469,27 @@ def filtrar_ruta(
 
     for ruta_id in rutas:
         datos_ruta = [r for r in resultados if r.ruta_id == ruta_id]
-        
+
         if not datos_ruta:
             continue
-        
+
         fechas = [r.fecha for r in datos_ruta]
-        montos = [round(r.total_monto) for r in datos_ruta]
+        montos_originales = [r.total_monto for r in datos_ruta]
+        montos_redondeados = [round(m, 0) for m in montos_originales]
         pasajeros = [r.total_pasajeros for r in datos_ruta]
-        total_montos = sum(montos)
+        total_montos = sum(montos_originales)
         total_pasajeros = sum(pasajeros)
-        
+
         ciudad_inicial = abreviaciones.get(datos_ruta[0].ciudad_inicial.upper(), datos_ruta[0].ciudad_inicial)
         ciudad_final = abreviaciones.get(datos_ruta[0].ciudad_final.upper(), datos_ruta[0].ciudad_final)
         nombre_ruta = f"{ciudad_inicial} - {ciudad_final}"
-        
-        monto_promedio = round(total_montos / len(montos), 0) if montos else 0
+
+        monto_promedio = round(total_montos / len(montos_originales)) if montos_originales else 0
+
         rutas_data.append({
             "nombre": nombre_ruta,
             "fechas": fechas,
-            "montos": montos,
+            "montos": montos_redondeados,
             "pasajeros": pasajeros,
             "monto_promedio": monto_promedio,
             "ultimo_registro": {
@@ -452,14 +499,16 @@ def filtrar_ruta(
             "total": f"{total_montos:,.0f}",
             "total_pasajeros": total_pasajeros,
         })
-        
+
         total_general += total_montos
         total_general_pasajeros += total_pasajeros
+
     return {
         "rutas": rutas_data,
         "total_general": f"{total_general:,.0f}",
         "total_pasajeros": total_general_pasajeros,
     }
+
 
 @router.get("/filtrar-auto")
 def filtrar_auto(
@@ -467,6 +516,7 @@ def filtrar_auto(
     servicio: Optional[str] = None,
     fecha_inicio: Optional[str] = None,
     fecha_fin: Optional[str] = None,
+    empresa_id: Optional[int] = Query(None, title="ID de la empresa"),  # Agregado el parámetro empresa_id
     db: Session = Depends(get_db)
 ):
     try:
@@ -483,6 +533,7 @@ def filtrar_auto(
             .filter(Ingreso.auto_id.in_(autos))
         )
 
+        # Filtros opcionales
         if servicio:
             query = query.filter(Ingreso.servicio == servicio)
         if fecha_inicio and fecha_fin:
@@ -491,6 +542,10 @@ def filtrar_auto(
             query = query.filter(Ingreso.fecha >= fecha_inicio)
         elif fecha_fin:
             query = query.filter(Ingreso.fecha <= fecha_fin)
+        
+        # Agregar filtro por empresa_id si es proporcionado
+        if empresa_id:
+            query = query.filter(Ingreso.empresa_id == empresa_id)
 
         query = query.group_by(Ingreso.auto_id, Auto.placa, "fecha").order_by("fecha")
         resultados = query.all()
@@ -537,7 +592,7 @@ def filtrar_auto(
                 "montos": montos,
                 "pasajeros": pasajeros,
                 "turnos": turnos,
-                "monto_promedio": round(monto_promedio, 2),
+                "monto_promedio": round(monto_promedio, 0),
                 "total_pasajeros": total_pasajeros_auto,
                 "total_turnos": total_turnos_auto,
                 "ultimo_registro": {
@@ -585,9 +640,10 @@ def obtener_turnos_por_ruta(
 
 @router.get("/ingresos_turno")
 def obtener_ingresos_filtrados(
-    idRuta: int,  # ✅ Primero los obligatorios
+    idRuta: int,
+    empresa_id: int,  # ✅ Nuevo parámetro obligatorio
     servicio: Optional[str] = None,
-    turnos: List[int] = Query(...),  # ✅ Query opcional después
+    turnos: List[int] = Query(...),
     fecha_inicio: Optional[str] = None,
     fecha_fin: Optional[str] = None,
     db: Session = Depends(get_db)
@@ -602,7 +658,11 @@ def obtener_ingresos_filtrados(
         func.sum(Ingreso.pasajero).label("total_pasajeros"),
         func.date(Ingreso.fecha).label("fecha")
     ).join(Turno, Ingreso.turno_id == Turno.id) \
-     .filter(Ingreso.turno_id.in_(turnos), Ingreso.ruta_id == idRuta)
+     .filter(
+         Ingreso.turno_id.in_(turnos),
+         Ingreso.ruta_id == idRuta,
+         Ingreso.empresa_id == empresa_id  # ✅ Se aplica el filtro por empresa
+     )
 
     if servicio != "Total":
         query = query.filter(Ingreso.servicio == servicio)
@@ -658,8 +718,8 @@ def obtener_ingresos_filtrados(
             "montos": montos,
             "total": f"{total_montos:,}",
             "pasajeros": cantidad_pasajeros,
-            "totalp": total_pasajeros_turno,
-            "monto_promedio": round(monto_promedio, 2),
+            "total_pasajeros": total_pasajeros_turno,
+            "monto_promedio": round(monto_promedio, 0),
             "ultimo_registro": {
                 "fecha": ultimo_registro.fecha,
                 "monto": ultimo_registro.total_monto,
@@ -674,13 +734,26 @@ def obtener_ingresos_filtrados(
         "total_general": f"{total_general:,}",
         "total_pasajeros": total_pasajeros,
     }
+
 @router.get("/ciudades", response_model=List[str])
-def obtener_ciudades(db: Session = Depends(get_db)):
-    ciudades = db.query(Ruta.ciudad_inicial).distinct().all()
-    return [ciudad[0] for ciudad in ciudades] 
+def obtener_ciudades(
+    empresa_id: int,
+    db: Session = Depends(get_db)
+):
+    ciudades = db.query(Ruta.ciudad_inicial).filter(
+        Ruta.empresa_id == empresa_id
+    ).distinct().all()
+    
+    return [ciudad[0] for ciudad in ciudades]
+
 @router.get("/rutas", response_model=List[RutaResponse])
-def obtener_rutas(db: Session = Depends(get_db)):
-    rutas = db.query(Ruta.id, Ruta.ciudad_inicial, Ruta.ciudad_final).distinct().all()
+def obtener_rutas(
+    empresa_id: int,
+    db: Session = Depends(get_db)
+):
+    rutas = db.query(Ruta.id, Ruta.ciudad_inicial, Ruta.ciudad_final).\
+        filter(Ruta.empresa_id == empresa_id).\
+        distinct().all()
 
     return [
         RutaResponse(
@@ -690,9 +763,15 @@ def obtener_rutas(db: Session = Depends(get_db)):
         ) 
         for ruta in rutas
     ]
+
 @router.get("/autos", response_model=List[AutoResponse])
-def obtener_autos(db: Session = Depends(get_db)):
-    autos = db.query(Auto.id, Auto.placa).distinct().all()
+def obtener_autos(
+    empresa_id: int,
+    db: Session = Depends(get_db)
+):
+    autos = db.query(Auto.id, Auto.placa).\
+        filter(Auto.empresa_id == empresa_id).\
+        distinct().all()
 
     return [
         AutoResponse(
@@ -701,8 +780,10 @@ def obtener_autos(db: Session = Depends(get_db)):
         ) 
         for auto in autos
     ]
+
 @router.get("/pieingresos_rutas")
 def ingresos_por_rutas(
+    empresa_id: int,  # ✅ Nuevo parámetro obligatorio
     rutas: List[int] = Query(...),
     fecha_inicio: str = Query(...),
     fecha_fin: str = Query(...),
@@ -715,8 +796,11 @@ def ingresos_por_rutas(
             func.sum(Ingreso.monto).label("total_monto"),
             func.sum(Ingreso.pasajero).label("total_pasajeros")
         )
-        .filter(Ingreso.ruta_id.in_(rutas))
-        .filter(Ingreso.fecha.between(fecha_inicio, fecha_fin))
+        .filter(
+            Ingreso.ruta_id.in_(rutas),
+            Ingreso.fecha.between(fecha_inicio, fecha_fin),
+            Ingreso.empresa_id == empresa_id  # ✅ Filtro por empresa
+        )
     )
 
     if servicio and servicio != "Total":
@@ -749,8 +833,10 @@ def ingresos_por_rutas(
             })
     
     return data
+
 @router.get("/pieingresos_autos")
 def ingresos_por_autos(
+    empresa_id: int,  # ✅ Nuevo parámetro obligatorio
     autos: List[int] = Query(...),
     fecha_inicio: str = Query(...),
     fecha_fin: str = Query(...),
@@ -758,11 +844,16 @@ def ingresos_por_autos(
     db: Session = Depends(get_db)
 ):
     query = (
-        db.query(Ingreso.auto_id, 
-                 func.sum(Ingreso.monto).label("total_monto"),
-                 func.sum(Ingreso.pasajero).label("total_pasajeros"))
-        .filter(Ingreso.auto_id.in_(autos))
-        .filter(Ingreso.fecha.between(fecha_inicio, fecha_fin))
+        db.query(
+            Ingreso.auto_id, 
+            func.sum(Ingreso.monto).label("total_monto"),
+            func.sum(Ingreso.pasajero).label("total_pasajeros")
+        )
+        .filter(
+            Ingreso.auto_id.in_(autos),
+            Ingreso.fecha.between(fecha_inicio, fecha_fin),
+            Ingreso.empresa_id == empresa_id  # ✅ Filtro por empresa
+        )
     )
 
     if servicio and servicio != "Total":
@@ -788,8 +879,10 @@ def ingresos_por_autos(
         })
     
     return data
+
 @router.get("/ingresos_rutas_auto")
 def obtener_ingresos_por_rutas_por_auto(
+    empresa_id: int = Query(..., description="ID de la empresa"),  # ✅ Nuevo parámetro obligatorio
     auto_id: int = Query(..., description="ID del auto"),
     fecha_inicio: Optional[str] = Query(None, description="Fecha de inicio"),
     fecha_fin: Optional[str] = Query(None, description="Fecha de fin"),
@@ -804,7 +897,10 @@ def obtener_ingresos_por_rutas_por_auto(
         func.sum(Ingreso.pasajero).label("total_pasajeros")
     ).join(Ruta, Ingreso.ruta_id == Ruta.id)
     
-    query = query.filter(Ingreso.auto_id == auto_id)
+    query = query.filter(
+        Ingreso.auto_id == auto_id,
+        Ingreso.empresa_id == empresa_id  # ✅ Filtro por empresa
+    )
     
     if fecha_inicio:
         query = query.filter(Ingreso.fecha >= fecha_inicio)
@@ -841,26 +937,40 @@ def obtener_ingresos_por_rutas_por_auto(
 
 @router.get("/comparaciontotales")
 def comparar_ingresos(
+    empresa_id: int,
     fecha_inicio_1: date,
     fecha_fin_1: date,
     fecha_inicio_2: date,
     fecha_fin_2: date,
     db: Session = Depends(get_db)
 ):
-    ingresos_rango_1 = db.query(Ingreso).filter(
+    ingresos_rango_1 = db.query(
+        Ingreso.fecha, 
+        func.sum(Ingreso.pasajero).label("total_pasajeros"), 
+        func.sum(Ingreso.monto).label("total_monto")
+    ).filter(
+        Ingreso.empresa_id == empresa_id,  # ✅ filtro por empresa
         Ingreso.fecha >= fecha_inicio_1,
         Ingreso.fecha <= fecha_fin_1
-    ).all()
+    ).group_by(Ingreso.fecha).order_by(Ingreso.fecha).all()
 
-    ingresos_rango_2 = db.query(Ingreso).filter(
+    ingresos_rango_2 = db.query(
+        Ingreso.fecha, 
+        func.sum(Ingreso.pasajero).label("total_pasajeros"), 
+        func.sum(Ingreso.monto).label("total_monto")
+    ).filter(
+        Ingreso.empresa_id == empresa_id,  # ✅ filtro por empresa
         Ingreso.fecha >= fecha_inicio_2,
         Ingreso.fecha <= fecha_fin_2
-    ).all()
+    ).group_by(Ingreso.fecha).order_by(Ingreso.fecha).all()
 
     def procesar_ingresos(ingresos):
-        total_pasajeros = sum(i.pasajero for i in ingresos)
-        monto_total = sum(i.monto for i in ingresos)
-        datos_por_fecha = {i.fecha: {"pasajeros": i.pasajero, "monto": float(i.monto)} for i in ingresos}
+        total_pasajeros = sum(pasajeros for _, pasajeros, _ in ingresos)
+        monto_total = sum(int(monto) for _, _, monto in ingresos)
+        datos_por_fecha = {
+            fecha: {"pasajeros": pasajeros, "monto": int(monto)} 
+            for fecha, pasajeros, monto in ingresos
+        }
         return total_pasajeros, monto_total, datos_por_fecha
 
     pasajeros_1, monto_1, datos_1 = procesar_ingresos(ingresos_rango_1)
@@ -870,8 +980,10 @@ def comparar_ingresos(
         "rango_1": {"total_pasajeros": pasajeros_1, "monto_total": monto_1, "detalles": datos_1},
         "rango_2": {"total_pasajeros": pasajeros_2, "monto_total": monto_2, "detalles": datos_2}
     }
+
 @router.get("/comparacionauto")
 def comparar_ingresos(
+    empresa_id: int,
     auto_id: int,
     fecha_inicio_1: date,
     fecha_fin_1: date,
@@ -879,33 +991,38 @@ def comparar_ingresos(
     fecha_fin_2: date,
     db: Session = Depends(get_db)
 ):
-    # Obtener ingresos del primer rango de fechas, agrupando y ordenando por fecha
+    # Obtener ingresos del primer rango de fechas
     ingresos_rango_1 = db.query(
         Ingreso.fecha, 
         func.sum(Ingreso.pasajero).label("total_pasajeros"), 
         func.sum(Ingreso.monto).label("total_monto")
     ).filter(
+        Ingreso.empresa_id == empresa_id,     # ✅ filtro por empresa
         Ingreso.auto_id == auto_id,
         Ingreso.fecha >= fecha_inicio_1,
         Ingreso.fecha <= fecha_fin_1
     ).group_by(Ingreso.fecha).order_by(Ingreso.fecha).all()
 
-    # Obtener ingresos del segundo rango de fechas, agrupando y ordenando por fecha
+    # Obtener ingresos del segundo rango de fechas
     ingresos_rango_2 = db.query(
         Ingreso.fecha, 
         func.sum(Ingreso.pasajero).label("total_pasajeros"), 
         func.sum(Ingreso.monto).label("total_monto")
     ).filter(
+        Ingreso.empresa_id == empresa_id,     # ✅ filtro por empresa
         Ingreso.auto_id == auto_id,
         Ingreso.fecha >= fecha_inicio_2,
         Ingreso.fecha <= fecha_fin_2
     ).group_by(Ingreso.fecha).order_by(Ingreso.fecha).all()
 
-    # Procesar ingresos manteniendo el orden
+    # Procesar ingresos
     def procesar_ingresos(ingresos):
         total_pasajeros = sum(pasajeros for _, pasajeros, _ in ingresos)
-        monto_total = sum(int(monto) for _, _, monto in ingresos)  # Convertir monto a entero
-        datos_por_fecha = OrderedDict((fecha, {"pasajeros": pasajeros, "monto": int(monto)}) for fecha, pasajeros, monto in ingresos)
+        monto_total = sum(int(monto) for _, _, monto in ingresos)
+        datos_por_fecha = {
+            fecha: {"pasajeros": pasajeros, "monto": int(monto)} 
+            for fecha, pasajeros, monto in ingresos
+        }
         return total_pasajeros, monto_total, datos_por_fecha
 
     pasajeros_1, monto_1, datos_1 = procesar_ingresos(ingresos_rango_1)
@@ -915,8 +1032,10 @@ def comparar_ingresos(
         "rango_1": {"total_pasajeros": pasajeros_1, "monto_total": monto_1, "detalles": datos_1},
         "rango_2": {"total_pasajeros": pasajeros_2, "monto_total": monto_2, "detalles": datos_2}
     }
+
 @router.get("/comparacionoficina")
 def comparar_ingresos(
+    empresa_id: int,
     oficina: str,
     fecha_inicio_1: date,
     fecha_fin_1: date,
@@ -924,29 +1043,38 @@ def comparar_ingresos(
     fecha_fin_2: date,
     db: Session = Depends(get_db)
 ):
-    # Consultar ingresos para el primer rango de fechas agrupando correctamente
-    ingresos_rango_1 = db.query(Ingreso.fecha, func.sum(Ingreso.pasajero), func.sum(Ingreso.monto)).\
-        join(Ruta, Ingreso.ruta_id == Ruta.id).\
-        filter(
-            Ruta.ciudad_inicial == oficina,  
-            Ingreso.fecha >= fecha_inicio_1,
-            Ingreso.fecha <= fecha_fin_1
-        ).group_by(Ingreso.fecha).all()
+    # Consultar ingresos para el primer rango de fechas
+    ingresos_rango_1 = db.query(
+        Ingreso.fecha, 
+        func.sum(Ingreso.pasajero), 
+        func.sum(Ingreso.monto)
+    ).join(Ruta, Ingreso.ruta_id == Ruta.id).filter(
+        Ingreso.empresa_id == empresa_id,          # ✅ filtro por empresa
+        Ruta.ciudad_inicial == oficina,  
+        Ingreso.fecha >= fecha_inicio_1,
+        Ingreso.fecha <= fecha_fin_1
+    ).group_by(Ingreso.fecha).all()
 
-    # Consultar ingresos para el segundo rango de fechas agrupando correctamente
-    ingresos_rango_2 = db.query(Ingreso.fecha, func.sum(Ingreso.pasajero), func.sum(Ingreso.monto)).\
-        join(Ruta, Ingreso.ruta_id == Ruta.id).\
-        filter(
-            Ruta.ciudad_inicial == oficina,  
-            Ingreso.fecha >= fecha_inicio_2,
-            Ingreso.fecha <= fecha_fin_2
-        ).group_by(Ingreso.fecha).all()
+    # Consultar ingresos para el segundo rango de fechas
+    ingresos_rango_2 = db.query(
+        Ingreso.fecha, 
+        func.sum(Ingreso.pasajero), 
+        func.sum(Ingreso.monto)
+    ).join(Ruta, Ingreso.ruta_id == Ruta.id).filter(
+        Ingreso.empresa_id == empresa_id,          # ✅ filtro por empresa
+        Ruta.ciudad_inicial == oficina,  
+        Ingreso.fecha >= fecha_inicio_2,
+        Ingreso.fecha <= fecha_fin_2
+    ).group_by(Ingreso.fecha).all()
 
-    # Procesar datos para cada rango
+    # Procesar datos
     def procesar_ingresos(ingresos):
         total_pasajeros = sum(pasajeros for _, pasajeros, _ in ingresos)
-        monto_total = sum(int(monto) for _, _, monto in ingresos)  # Convertir monto a entero
-        datos_por_fecha = {fecha: {"pasajeros": pasajeros, "monto": int(monto)} for fecha, pasajeros, monto in ingresos}
+        monto_total = sum(int(monto) for _, _, monto in ingresos)
+        datos_por_fecha = {
+            fecha: {"pasajeros": pasajeros, "monto": int(monto)} 
+            for fecha, pasajeros, monto in ingresos
+        }
         return total_pasajeros, monto_total, datos_por_fecha
 
     pasajeros_1, monto_1, datos_1 = procesar_ingresos(ingresos_rango_1)
@@ -956,8 +1084,10 @@ def comparar_ingresos(
         "rango_1": {"total_pasajeros": pasajeros_1, "monto_total": monto_1, "detalles": datos_1},
         "rango_2": {"total_pasajeros": pasajeros_2, "monto_total": monto_2, "detalles": datos_2}
     }
+
 @router.get("/comparacionruta")
 def comparar_ingresos(
+    empresa_id: int,
     ruta_id: int,
     fecha_inicio_1: date,
     fecha_fin_1: date,
@@ -965,33 +1095,35 @@ def comparar_ingresos(
     fecha_fin_2: date,
     db: Session = Depends(get_db)
 ):
-    # Obtener ingresos del primer rango de fechas, agrupando por fecha
     ingresos_rango_1 = db.query(
         Ingreso.fecha, 
         func.sum(Ingreso.pasajero).label("total_pasajeros"), 
         func.sum(Ingreso.monto).label("total_monto")
     ).filter(
+        Ingreso.empresa_id == empresa_id,      
         Ingreso.ruta_id == ruta_id,
         Ingreso.fecha >= fecha_inicio_1,
         Ingreso.fecha <= fecha_fin_1
     ).group_by(Ingreso.fecha).all()
 
-    # Obtener ingresos del segundo rango de fechas, agrupando por fecha
     ingresos_rango_2 = db.query(
         Ingreso.fecha, 
         func.sum(Ingreso.pasajero).label("total_pasajeros"), 
         func.sum(Ingreso.monto).label("total_monto")
     ).filter(
+        Ingreso.empresa_id == empresa_id,       
         Ingreso.ruta_id == ruta_id,
         Ingreso.fecha >= fecha_inicio_2,
         Ingreso.fecha <= fecha_fin_2
     ).group_by(Ingreso.fecha).all()
 
-    # Procesar ingresos para cada rango
     def procesar_ingresos(ingresos):
         total_pasajeros = sum(pasajeros for _, pasajeros, _ in ingresos)
-        monto_total = sum(int(monto) for _, _, monto in ingresos)  # Convertir monto a entero
-        datos_por_fecha = {fecha: {"pasajeros": pasajeros, "monto": int(monto)} for fecha, pasajeros, monto in ingresos}
+        monto_total = sum(int(monto) for _, _, monto in ingresos)
+        datos_por_fecha = {
+            fecha: {"pasajeros": pasajeros, "monto": int(monto)} 
+            for fecha, pasajeros, monto in ingresos
+        }
         return total_pasajeros, monto_total, datos_por_fecha
 
     pasajeros_1, monto_1, datos_1 = procesar_ingresos(ingresos_rango_1)
@@ -1001,10 +1133,19 @@ def comparar_ingresos(
         "rango_1": {"total_pasajeros": pasajeros_1, "monto_total": monto_1, "detalles": datos_1},
         "rango_2": {"total_pasajeros": pasajeros_2, "monto_total": monto_2, "detalles": datos_2}
     }
-@router.get("/ultima-fecha", response_model=dict[str, date]) 
-def obtener_ultima_fecha(db: Session = Depends(get_db)):
-    ultima_fecha = db.query(Ingreso.fecha).order_by(Ingreso.fecha.desc()).first()
+
+@router.get("/ultima-fecha", response_model=dict[str, date])
+def obtener_ultima_fecha(
+    empresa_id: int = Query(..., description="ID de la empresa"),  # ✅ parámetro obligatorio
+    db: Session = Depends(get_db)
+):
+    ultima_fecha = db.query(Ingreso.fecha).\
+        filter(Ingreso.empresa_id == empresa_id).\
+        order_by(Ingreso.fecha.desc()).\
+        first()
+        
     if ultima_fecha:
-        return {"fecha": ultima_fecha[0]} 
-    return {"fecha": None} 
+        return {"fecha": ultima_fecha[0]}
+    return {"fecha": None}
+
 
